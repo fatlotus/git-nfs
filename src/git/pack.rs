@@ -47,6 +47,7 @@ pub struct GitRawObject {
 
 struct PendingDelta {
     obj_offset: usize,
+    #[allow(dead_code)]
     delta_type: ObjectType,
     base_offset: Option<usize>,
     base_sha: Option<String>,

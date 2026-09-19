@@ -93,6 +93,7 @@ impl GitTree {
         Ok(GitTree { entries })
     }
 
+    #[allow(dead_code)]
     pub fn find(&self, name: &str) -> Option<&GitTreeEntry> {
         self.entries.iter().find(|e| e.name == name)
     }

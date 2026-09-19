@@ -1,13 +1,19 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use tracing::{debug, info};
 
-use crate::git::protocol::{delim_pkt, encode_pkt_line, extract_pack_from_sideband, flush_pkt, parse_pkt_lines};
+use crate::git::protocol::{
+    delim_pkt, encode_pkt_line, extract_pack_from_sideband, flush_pkt, parse_pkt_lines,
+};
 
 #[derive(Clone)]
 pub struct GitSmartHttpClient {
     client: Client,
     base_url: String,
+    request_count: Arc<AtomicU64>,
 }
 
 impl GitSmartHttpClient {
@@ -21,11 +27,21 @@ impl GitSmartHttpClient {
             .build()
             .expect("Failed to build HTTP client");
 
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            request_count: Arc::new(AtomicU64::new(0)),
+        }
     }
 
+    #[allow(dead_code)]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    #[allow(dead_code)]
+    pub fn request_count(&self) -> u64 {
+        self.request_count.load(Ordering::Relaxed)
     }
 
     /// Resolves the default branch HEAD commit OID.
@@ -41,6 +57,7 @@ impl GitSmartHttpClient {
         body.extend(encode_pkt_line("ref-prefix refs/heads/"));
         body.extend(flush_pkt());
 
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         let res = self
             .client
             .post(&endpoint)
@@ -110,6 +127,7 @@ impl GitSmartHttpClient {
         body.extend(encode_pkt_line("done"));
         body.extend(flush_pkt());
 
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         let res = self
             .client
             .post(&endpoint)
@@ -134,19 +152,26 @@ impl GitSmartHttpClient {
         Ok(pack)
     }
 
-    /// Lazily fetches a single blob by its OID.
-    pub async fn fetch_blob_pack(&self, blob_oid: &str) -> Result<Vec<u8>> {
-        debug!("Fetching blob {blob_oid}...");
+    /// Fetches multiple blobs in a single batch request over Git Protocol v2.
+    pub async fn fetch_blobs_pack(&self, blob_oids: &[&str]) -> Result<Vec<u8>> {
+        if blob_oids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug!("Fetching batch of {} blobs...", blob_oids.len());
         let endpoint = format!("{}/git-upload-pack", self.base_url);
 
         let mut body = Vec::new();
         body.extend(encode_pkt_line("command=fetch"));
         body.extend(encode_pkt_line("agent=git-nfs"));
         body.extend(delim_pkt());
-        body.extend(encode_pkt_line(&format!("want {blob_oid}")));
+        for oid in blob_oids {
+            body.extend(encode_pkt_line(&format!("want {oid}")));
+        }
         body.extend(encode_pkt_line("done"));
         body.extend(flush_pkt());
 
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         let res = self
             .client
             .post(&endpoint)
@@ -155,18 +180,31 @@ impl GitSmartHttpClient {
             .body(body)
             .send()
             .await
-            .context(format!("Sending fetch blob request for {blob_oid}"))?;
+            .context(format!(
+                "Sending fetch blobs request for {} objects",
+                blob_oids.len()
+            ))?;
 
         if !res.status().is_success() {
             return Err(anyhow!(
-                "fetch blob {blob_oid} failed with status {}: {}",
+                "fetch blobs failed with status {}: {}",
                 res.status(),
                 res.text().await.unwrap_or_default()
             ));
         }
 
-        let resp_bytes = res.bytes().await.context("Reading fetch blob response")?;
+        let resp_bytes = res.bytes().await.context("Reading fetch blobs response")?;
         let pack = extract_pack_from_sideband(&resp_bytes)?;
+        debug!(
+            "Downloaded packfile for {} blobs ({} bytes)",
+            blob_oids.len(),
+            pack.len()
+        );
         Ok(pack)
+    }
+
+    /// Lazily fetches a single blob by its OID (delegates to fetch_blobs_pack).
+    pub async fn fetch_blob_pack(&self, blob_oid: &str) -> Result<Vec<u8>> {
+        self.fetch_blobs_pack(&[blob_oid]).await
     }
 }

@@ -55,6 +55,10 @@ impl VfsManager {
         }
     }
 
+    pub fn git_engine(&self) -> &Arc<GitEngine> {
+        &self.git_engine
+    }
+
     pub fn get_node(&self, id: u64) -> Option<Arc<VfsNode>> {
         let node = self.nodes.read().get(&id).cloned()?;
         if *node.is_deleted.read() {
@@ -95,7 +99,13 @@ impl VfsManager {
                 } else {
                     let id = self.next_inode.fetch_add(1, Ordering::Relaxed);
                     let is_dir = entry.mode.is_dir();
-                    let initial_size = if is_dir { 4096 } else { 1024 * 1024 };
+                    let initial_size = if is_dir {
+                        4096
+                    } else if let Some(blob) = self.git_engine.memory_cache().get(&entry.oid) {
+                        blob.len() as u64
+                    } else {
+                        1024 * 1024
+                    };
 
                     let node = Arc::new(VfsNode {
                         id,
@@ -337,6 +347,7 @@ impl VfsManager {
     }
 
     /// Returns a list of all active nodes.
+    #[allow(dead_code)]
     pub fn all_active_nodes(&self) -> Vec<Arc<VfsNode>> {
         self.nodes
             .read()

@@ -52,10 +52,14 @@ impl GitNfsFileSystem {
             ftype3::NF3REG
         };
 
-        // If staged, use staged size; otherwise use cached size
+        // If staged, use staged size; if cached in memory, use true blob length; otherwise use node.size
         let size = self
             .staging
             .get_size(node.id)
+            .or_else(|| {
+                let oid = node.oid.read();
+                self.git_engine.memory_cache().get(&oid).map(|d| d.len() as u64)
+            })
             .unwrap_or_else(|| *node.size.read());
 
         fattr3 {
@@ -175,7 +179,20 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         // 2. Otherwise read from original Git blob
         let oid = node.oid.read().clone();
-        let data: Vec<u8> = self.git_engine.get_blob(&oid).await.map_err(|e| {
+
+        // If the blob is missing from both memory and disk caches, prefetch
+        // all companion files in the parent directory in a single batch request!
+        if self.git_engine.memory_cache().get(&oid).is_none()
+            && !self.git_engine.disk_cache().has_blob(&oid)
+        {
+            let parent_id = *node.parent_id.read();
+            if let Some(parent_node) = self.vfs.get_node(parent_id) {
+                let parent_oid = parent_node.oid.read().clone();
+                let _ = self.git_engine.prefetch_directory_blobs(&parent_oid).await;
+            }
+        }
+
+        let data = self.git_engine.get_blob_arc(&oid).await.map_err(|e| {
             warn!("Failed to fetch blob {}: {e}", oid);
             nfsstat3::NFS3ERR_IO
         })?;
@@ -306,6 +323,15 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         let children = self.vfs.list_dir(dirid).map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+        // On first readdir page of a directory, trigger background prefetch of its file blobs
+        if start_after == 0 {
+            let dir_oid = dir_node.oid.read().clone();
+            let engine = self.git_engine.clone();
+            tokio::spawn(async move {
+                let _ = engine.prefetch_directory_blobs(&dir_oid).await;
+            });
+        }
+
         let mut all_entries = Vec::with_capacity(children.len() + 2);
 
         // "."
@@ -375,11 +401,11 @@ impl NFSFileSystem for GitNfsFileSystem {
         }
 
         let oid = node.oid.read().clone();
-        let data: Vec<u8> = self.git_engine.get_blob(&oid).await.map_err(|e| {
+        let data = self.git_engine.get_blob_arc(&oid).await.map_err(|e| {
             warn!("Failed to read symlink target {}: {e}", oid);
             nfsstat3::NFS3ERR_IO
         })?;
 
-        Ok(nfspath3::from(data))
+        Ok(nfspath3::from((*data).clone()))
     }
 }

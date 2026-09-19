@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Result};
@@ -35,11 +35,13 @@ pub fn compare_tree_entries(name_a: &str, is_dir_a: bool, name_b: &str, is_dir_b
 }
 
 /// Recursively reconstructs modified Git trees starting from root.
-/// Returns all newly created objects (blobs, trees, commit) ready for packing.
+/// Returns ONLY newly created or modified objects (blobs, changed trees, new commit).
+/// Any existing trees that were untouched or already exist in the base repository
+/// are pruned from the packfile.
 pub async fn rebuild_git_objects(
     vfs: &VfsManager,
     staging: &StagingStore,
-    _git_engine: &GitEngine,
+    git_engine: &GitEngine,
     base_commit_oid: &str,
     author: &str,
     commit_message: &str,
@@ -48,7 +50,7 @@ pub async fn rebuild_git_objects(
 
     // 1. Process all staged (modified or created) files into new Git blobs
     let staged_node_ids = staging.list_staged_nodes();
-    for node_id in staged_node_ids {
+    for &node_id in &staged_node_ids {
         if let Some(node) = vfs.get_node(node_id) {
             let name = node.name.read().clone();
             // Skip macOS metadata files from git objects
@@ -72,10 +74,37 @@ pub async fn rebuild_git_objects(
         }
     }
 
-    // 2. Recursively rebuild trees starting from root inode (1)
-    let new_root_tree_oid = rebuild_tree_recursive(ROOT_INODE, vfs, &mut new_objects)?;
+    // 2. Identify dirty directories (ancestors of all modified or deleted nodes)
+    let deleted_node_ids = staging.list_deleted_nodes();
+    let mut dirty_dirs = HashSet::new();
+    dirty_dirs.insert(ROOT_INODE);
 
-    // 3. Construct new Commit Object
+    for &node_id in staged_node_ids.iter().chain(deleted_node_ids.iter()) {
+        let mut curr = node_id;
+        while let Some(node) = vfs.get_node(curr) {
+            if node.is_dir {
+                dirty_dirs.insert(node.id);
+            }
+            let parent = *node.parent_id.read();
+            dirty_dirs.insert(parent);
+            if parent == ROOT_INODE || parent == curr {
+                break;
+            }
+            curr = parent;
+        }
+    }
+
+    // 3. Recursively rebuild ONLY modified trees starting from root inode (1)
+    let new_root_tree_oid = rebuild_tree_recursive(
+        ROOT_INODE,
+        vfs,
+        staging,
+        git_engine,
+        &dirty_dirs,
+        &mut new_objects,
+    )?;
+
+    // 4. Construct new Commit Object
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -99,7 +128,7 @@ pub async fn rebuild_git_objects(
 
     let objects_list: Vec<GitObjectToPack> = new_objects.into_values().collect();
     info!(
-        "Rebuilt Git state: New commit {} with {} objects",
+        "Rebuilt Git state: New commit {} with {} objects (pruned unchanged trees)",
         new_commit_oid,
         objects_list.len()
     );
@@ -110,14 +139,17 @@ pub async fn rebuild_git_objects(
 fn rebuild_tree_recursive(
     dir_id: u64,
     vfs: &VfsManager,
+    staging: &StagingStore,
+    git_engine: &GitEngine,
+    dirty_dirs: &HashSet<u64>,
     new_objects: &mut HashMap<String, GitObjectToPack>,
 ) -> Result<String> {
     let children = vfs.list_dir(dir_id)?;
 
-    // Filter out Apple metadata and sort children canonically
+    // Filter out Apple metadata and deleted files, sort canonically
     let mut valid_children: Vec<_> = children
         .into_iter()
-        .filter(|c| !is_apple_metadata(&c.name.read()))
+        .filter(|c| !is_apple_metadata(&c.name.read()) && !staging.is_deleted(c.id))
         .collect();
 
     valid_children.sort_by(|a, b| {
@@ -134,8 +166,12 @@ fn rebuild_tree_recursive(
     for child in valid_children {
         let child_name = child.name.read().clone();
         let child_oid = if child.is_dir {
-            // Recurse into subdirectory to get its (potentially new) tree OID
-            rebuild_tree_recursive(child.id, vfs, new_objects)?
+            // Only recurse if subdirectory has modifications in its subtree
+            if dirty_dirs.contains(&child.id) {
+                rebuild_tree_recursive(child.id, vfs, staging, git_engine, dirty_dirs, new_objects)?
+            } else {
+                child.oid.read().clone()
+            }
         } else {
             child.oid.read().clone()
         };
@@ -162,14 +198,18 @@ fn rebuild_tree_recursive(
 
     let tree_sha = compute_git_sha1(ObjectType::Tree, &raw_tree);
 
-    new_objects.insert(
-        tree_sha.clone(),
-        GitObjectToPack {
-            oid: tree_sha.clone(),
-            obj_type: ObjectType::Tree,
-            data: raw_tree,
-        },
-    );
+    // Only insert into new_objects if this tree is genuinely new
+    // (i.e. not already present in the base Git repository)
+    if git_engine.get_tree(&tree_sha).is_none() {
+        new_objects.insert(
+            tree_sha.clone(),
+            GitObjectToPack {
+                oid: tree_sha.clone(),
+                obj_type: ObjectType::Tree,
+                data: raw_tree,
+            },
+        );
+    }
 
     Ok(tree_sha)
 }
@@ -191,5 +231,66 @@ mod tests {
             compare_tree_entries("foo", true, "foo1", false),
             Ordering::Less
         );
+    }
+
+    #[tokio::test]
+    async fn test_tree_pruning_only_packs_changed_objects() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new()?;
+        let git_engine = GitEngine::new("https://example.com/repo.git", Some(temp.path()))?;
+        let staging = StagingStore::new(temp.path())?;
+
+        let vfs = VfsManager::new(std::sync::Arc::new(git_engine), "0000000000000000000000000000000000000000");
+
+        // Create dir_a and dir_b
+        let dir_a = vfs.mkdir(ROOT_INODE, "dir_a")?;
+        let dir_b = vfs.mkdir(ROOT_INODE, "dir_b")?;
+
+        // In dir_b, set an existing tree OID
+        let b_tree_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        *dir_b.oid.write() = b_tree_sha.to_string();
+
+        // In dir_a, create file.txt
+        let file_a = vfs.create_file(dir_a.id, "file.txt", TreeEntryMode::RegularFile)?;
+
+        // Modify file.txt in staging
+        staging.write_at(file_a.id, 0, b"hello world", None)?;
+
+        let git_engine_ref = vfs.git_engine();
+        let (commit_oid, objects) = rebuild_git_objects(
+            &vfs,
+            &staging,
+            git_engine_ref,
+            "1111111111111111111111111111111111111111",
+            "Test <test@example.com>",
+            "Test commit",
+        )
+        .await?;
+
+        assert!(!commit_oid.is_empty());
+
+        // Objects must ONLY contain:
+        // 1. file_a blob ("hello world")
+        // 2. dir_a new tree
+        // 3. root new tree
+        // 4. new commit
+        // dir_b tree must NOT be in objects!
+        assert_eq!(
+            objects.len(),
+            4,
+            "Expected 4 objects (1 blob + 2 changed trees + 1 commit), got {}",
+            objects.len()
+        );
+
+        let types: Vec<_> = objects.iter().map(|o| o.obj_type).collect();
+        assert_eq!(types.iter().filter(|&&t| t == ObjectType::Blob).count(), 1);
+        assert_eq!(types.iter().filter(|&&t| t == ObjectType::Tree).count(), 2);
+        assert_eq!(types.iter().filter(|&&t| t == ObjectType::Commit).count(), 1);
+
+        // Ensure dir_b's tree was NOT included
+        assert!(!objects.iter().any(|o| o.oid == b_tree_sha));
+
+        Ok(())
     }
 }

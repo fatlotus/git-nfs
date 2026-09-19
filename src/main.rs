@@ -1,10 +1,3 @@
-mod cache;
-mod git;
-mod mount;
-mod nfs;
-mod staging;
-mod vfs;
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -16,14 +9,14 @@ use tokio::signal;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::git::builder::rebuild_git_objects;
-use crate::git::pack_writer::PackWriter;
-use crate::git::GitEngine;
-use crate::mount::NfsMounter;
-use crate::nfs::fs::GitNfsFileSystem;
-use crate::nfs::start_nfs_server;
-use crate::staging::StagingStore;
-use crate::vfs::inode::VfsManager;
+use git_nfs::git::builder::rebuild_git_objects;
+use git_nfs::git::pack_writer::PackWriter;
+use git_nfs::git::GitEngine;
+use git_nfs::mount::NfsMounter;
+use git_nfs::nfs::fs::GitNfsFileSystem;
+use git_nfs::nfs::start_nfs_server;
+use git_nfs::staging::StagingStore;
+use git_nfs::vfs::inode::VfsManager;
 
 #[derive(Parser, Debug)]
 #[command(name = "git-nfs")]

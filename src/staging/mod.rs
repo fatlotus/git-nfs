@@ -39,6 +39,10 @@ impl StagingStore {
         self.deleted_nodes.read().contains(&node_id)
     }
 
+    pub fn list_deleted_nodes(&self) -> Vec<u64> {
+        self.deleted_nodes.read().iter().copied().collect()
+    }
+
     pub fn mark_deleted(&self, node_id: u64) {
         self.deleted_nodes.write().insert(node_id);
     }
