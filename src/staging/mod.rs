@@ -18,6 +18,9 @@ pub struct StagingStore {
 impl StagingStore {
     pub fn new(base_cache_dir: &Path) -> Result<Self> {
         let staging_dir = base_cache_dir.join("staging");
+        if staging_dir.exists() {
+            let _ = fs::remove_dir_all(&staging_dir);
+        }
         fs::create_dir_all(&staging_dir).context("Creating staging directory")?;
 
         Ok(Self {

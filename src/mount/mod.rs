@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 
 pub struct NfsMounter {
     mountpoint: String,
+    unmounted: AtomicBool,
 }
 
 impl NfsMounter {
@@ -60,10 +62,16 @@ impl NfsMounter {
         }
 
         info!("Successfully mounted repository to {mount_str}");
-        Ok(Self { mountpoint: mount_str })
+        Ok(Self {
+            mountpoint: mount_str,
+            unmounted: AtomicBool::new(false),
+        })
     }
 
     pub fn unmount(&self) {
+        if self.unmounted.swap(true, Ordering::SeqCst) {
+            return;
+        }
         info!("Unmounting {}...", self.mountpoint);
         #[cfg(target_os = "macos")]
         let cmd = "/sbin/umount";

@@ -163,8 +163,20 @@ async fn main() -> Result<()> {
     println!("👉 Press Ctrl+C to unmount and automatically generate the Git packfile of your changes.");
     println!();
 
-    // Wait for SIGINT or SIGTERM
-    signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+    // Wait for SIGINT (Ctrl+C) or SIGTERM (kill)
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+    }
     info!("Shutting down Git NFS server...");
 
     // Cleanly unmount first so no more writes arrive

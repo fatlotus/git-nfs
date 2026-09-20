@@ -103,6 +103,8 @@ impl VfsManager {
                         4096
                     } else if let Some(blob) = self.git_engine.memory_cache().get(&entry.oid) {
                         blob.len() as u64
+                    } else if let Some(len) = self.git_engine.disk_cache().get_blob_size(&entry.oid) {
+                        len
                     } else {
                         1024 * 1024
                     };

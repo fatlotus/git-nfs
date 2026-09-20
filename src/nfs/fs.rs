@@ -52,13 +52,17 @@ impl GitNfsFileSystem {
             ftype3::NF3REG
         };
 
-        // If staged, use staged size; if cached in memory, use true blob length; otherwise use node.size
+        // If staged, use staged size; if cached in memory/disk, use true blob length; otherwise use node.size
         let size = self
             .staging
             .get_size(node.id)
             .or_else(|| {
                 let oid = node.oid.read();
-                self.git_engine.memory_cache().get(&oid).map(|d| d.len() as u64)
+                self.git_engine
+                    .memory_cache()
+                    .get(&oid)
+                    .map(|d| d.len() as u64)
+                    .or_else(|| self.git_engine.disk_cache().get_blob_size(&oid))
             })
             .unwrap_or_else(|| *node.size.read());
 
@@ -128,6 +132,18 @@ impl NFSFileSystem for GitNfsFileSystem {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
         let node = self.vfs.get_node(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+        if !node.is_dir && !self.staging.is_staged(id) {
+            let oid = node.oid.read().clone();
+            if !oid.is_empty() {
+                if let Some(blob) = self.git_engine.memory_cache().get(&oid) {
+                    self.vfs.update_file_size(id, blob.len() as u64);
+                } else if let Some(len) = self.git_engine.disk_cache().get_blob_size(&oid) {
+                    self.vfs.update_file_size(id, len);
+                } else if let Ok(data) = self.git_engine.get_blob_arc(&oid).await {
+                    self.vfs.update_file_size(id, data.len() as u64);
+                }
+            }
+        }
         Ok(self.node_to_fattr3(&node))
     }
 
@@ -227,9 +243,19 @@ impl NFSFileSystem for GitNfsFileSystem {
             None
         };
 
+        let actual_offset = if let Some(ref base) = base_data {
+            if offset > base.len() as u64 {
+                base.len() as u64
+            } else {
+                offset
+            }
+        } else {
+            offset
+        };
+
         let new_len = self
             .staging
-            .write_at(id, offset, data, base_data.as_deref())
+            .write_at(id, actual_offset, data, base_data.as_deref())
             .map_err(|e| {
                 warn!("Failed to write to staging for node {id}: {e}");
                 nfsstat3::NFS3ERR_IO

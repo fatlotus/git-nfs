@@ -55,6 +55,11 @@ impl DiskCache {
         self.blob_path(oid).is_file()
     }
 
+    pub fn get_blob_size(&self, oid: &str) -> Option<u64> {
+        let path = self.blob_path(oid);
+        fs::metadata(&path).ok().map(|m| m.len())
+    }
+
     pub fn get_blob(&self, oid: &str) -> Option<Vec<u8>> {
         let path = self.blob_path(oid);
         match fs::read(&path) {

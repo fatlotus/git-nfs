@@ -49,28 +49,42 @@ mkdir /tmp/linux-kernel/my_feature && echo "int test() { return 1; }" > /tmp/lin
 ```
 
 ### 3. Generate Packfile on Shutdown
-Press `Ctrl+C` in the terminal where `git-nfs` is running:
+Press `Ctrl+C` in the terminal where `git-nfs` is running, or send a termination signal (`kill <pid>` or `kill -INT <pid>`):
 
 ```text
 Shutting down Git NFS server...
 Successfully unmounted /tmp/linux-kernel
 
 Changes detected! Generating Git commit and packfile...
-Rebuilt Git state: New commit cf2d7b1... with 6283 objects
-Generated Git packfile: ./changes-cf2d7b1....pack (3,245,617 bytes)
+Rebuilt Git state: New commit c8f1e39... with 3 objects (pruned unchanged trees)
+Generated Git packfile: ./changes-c8f1e39....pack (3,475 bytes) and index: ./changes-c8f1e39....idx
 
 ===============================================================
 🎉 Successfully generated Git packfile containing your changes!
 ===============================================================
-📌 New Commit SHA : cf2d7b1bc7afa5f57cd7756c3bad93afa7be0387
-📌 Base Commit SHA: 40288c9206c17eb66a603262e06a58d300d0f279
-📦 Packfile       : ./changes-cf2d7b1....pack
-📄 Index file     : ./changes-cf2d7b1....idx
-📊 Total objects  : 6283
+📌 New Commit SHA : c8f1e399d8f374ac45457ff21311ad5640875b66
+📌 Base Commit SHA: 518e5b794c06c0f0eb40df3e202274a66202c137
+📦 Packfile       : ./changes-c8f1e39....pack
+📄 Index file     : ./changes-c8f1e39....idx
+📊 Total objects  : 3
 
 To inspect your packfile:
-  git verify-pack -v ./changes-cf2d7b1....pack
+  git verify-pack -v ./changes-c8f1e39....pack
 ===============================================================
+```
+
+### 4. Import Changes into a Local Git Repository
+To use or inspect your newly generated commit inside a local clone of the repository:
+
+```bash
+# 1. Copy the generated packfile and index into your repository's objects/pack directory:
+cp changes-<sha>.pack changes-<sha>.idx /path/to/repo/.git/objects/pack/
+
+# 2. Checkout the newly synthesized commit:
+git -C /path/to/repo checkout <sha>
+
+# 3. View your modifications:
+git -C /path/to/repo show HEAD
 ```
 
 ---
