@@ -7,7 +7,7 @@ pub mod protocol;
 pub mod smart_http;
 pub mod tree;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -184,15 +184,7 @@ impl GitEngine {
                 let (commit_oid, _branch_name) = storage.resolve_head(branch).await?;
                 *self.commit_oid.write() = Some(commit_oid.clone());
 
-                // Pre-cache all packfiles locally to enable instantaneous disk reads
-                let pack_names = storage.pack_names();
-
-                for pack_name in &pack_names {
-                    if let Err(e) = storage.ensure_pack_cached(pack_name).await {
-                        warn!("Could not cache pack {pack_name} (will use range reads): {e}");
-                    }
-                }
-
+                // Packfiles are read and cached on-demand in 10 MiB blocks via BlockCache.
                 // Read commit object to get root tree OID
                 let commit_raw = storage
                     .read_object_raw(&commit_oid)
@@ -212,38 +204,53 @@ impl GitEngine {
                     .ok_or_else(|| anyhow!("Could not find root tree in commit {commit_oid}"))?;
                 info!("Root tree OID from GCS: {root_oid}");
 
-                // Recursively traverse and parse all trees reachable from root
-                info!("Loading tree hierarchy from GCS packfiles...");
-                let mut queue = VecDeque::new();
-                queue.push_back(root_oid.clone());
+                // Recursively traverse and parse all trees reachable from root in parallel waves
+                info!("Loading tree hierarchy from GCS packfiles in parallel...");
+                let mut current_level = vec![root_oid.clone()];
+                let mut visited = HashSet::new();
+                visited.insert(root_oid.clone());
 
                 let mut loaded_trees = 0;
-                while let Some(tree_oid) = queue.pop_front() {
-                    if self.trees.read().contains_key(&tree_oid) {
-                        continue;
+                while !current_level.is_empty() {
+                    // 1. Prefetch all uncached blocks needed by this wave in parallel
+                    if let Err(e) = storage.prefetch_blocks_for_objects(&current_level).await {
+                        warn!("Block prefetch failed: {e}");
                     }
 
-                    match storage.read_object_raw(&tree_oid).await {
-                        Ok(raw_tree) => match GitTree::parse(&raw_tree.data) {
-                            Ok(parsed) => {
+                    // 2. Fetch and parse all trees in current_level in parallel
+                    let mut next_level = Vec::new();
+                    let chunk_size = 64;
+
+                    for chunk in current_level.chunks(chunk_size) {
+                        let mut tasks = Vec::with_capacity(chunk.len());
+                        for tree_oid in chunk {
+                            let s = storage.clone();
+                            let oid = tree_oid.clone();
+                            tasks.push(tokio::spawn(async move {
+                                match s.read_object_raw(&oid).await {
+                                    Ok(raw) => match GitTree::parse(&raw.data) {
+                                        Ok(parsed) => Ok((oid, parsed)),
+                                        Err(e) => Err(anyhow!("Failed to parse tree {oid}: {e}")),
+                                    },
+                                    Err(e) => Err(anyhow!("Failed to read tree {oid}: {e}")),
+                                }
+                            }));
+                        }
+
+                        for task in futures::future::join_all(tasks).await {
+                            if let Ok(Ok((oid, parsed))) = task {
                                 for entry in &parsed.entries {
-                                    if entry.mode.is_dir()
-                                        && !self.trees.read().contains_key(&entry.oid)
-                                    {
-                                        queue.push_back(entry.oid.clone());
+                                    if entry.mode.is_dir() && visited.insert(entry.oid.clone()) {
+                                        next_level.push(entry.oid.clone());
                                     }
                                 }
-                                self.trees.write().insert(tree_oid, Arc::new(parsed));
+                                self.trees.write().insert(oid, Arc::new(parsed));
                                 loaded_trees += 1;
                             }
-                            Err(e) => {
-                                warn!("Failed to parse tree {tree_oid}: {e}");
-                            }
-                        },
-                        Err(e) => {
-                            warn!("Failed to read tree object {tree_oid}: {e}");
                         }
                     }
+
+                    current_level = next_level;
                 }
 
                 info!("Successfully loaded {loaded_trees} trees into memory from GCS repository");

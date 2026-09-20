@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Read;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +12,7 @@ use google_cloud_storage::model_ext::ReadRange;
 use parking_lot::RwLock;
 use tracing::info;
 
+use crate::cache::block::{BlockCache, DEFAULT_BLOCK_SIZE};
 use crate::git::idx::PackIndex;
 use crate::git::pack::{apply_git_delta, GitRawObject, ObjectType};
 
@@ -22,6 +22,7 @@ pub struct GcsGitStorage {
     bucket: String,
     prefix: String,
     cache_dir: PathBuf,
+    block_cache: Arc<BlockCache>,
     pack_indexes: RwLock<Vec<PackIndex>>,
     // Cache of raw resolved objects by OID to deduplicate repeated delta resolution
     object_cache: RwLock<HashMap<String, Arc<GitRawObject>>>,
@@ -42,12 +43,18 @@ impl GcsGitStorage {
         let storage_cache_dir = cache_dir.join("gcs_repo");
         fs::create_dir_all(&storage_cache_dir).context("Creating GCS repo cache dir")?;
 
+        let block_cache = Arc::new(BlockCache::new(
+            storage_cache_dir.clone(),
+            DEFAULT_BLOCK_SIZE,
+        ));
+
         let s = Self {
             storage,
             control,
             bucket: formatted_bucket,
             prefix: clean_prefix,
             cache_dir: storage_cache_dir,
+            block_cache,
             pack_indexes: RwLock::new(Vec::new()),
             object_cache: RwLock::new(HashMap::new()),
         };
@@ -72,6 +79,20 @@ impl GcsGitStorage {
 
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    pub fn block_cache(&self) -> &Arc<BlockCache> {
+        &self.block_cache
+    }
+
+    pub fn get_pack_object_len(&self, pack_name: &str, offset: u64) -> Option<usize> {
+        let indexes = self.pack_indexes.read();
+        for idx in indexes.iter() {
+            if idx.pack_name == pack_name {
+                return idx.get_object_len_at_offset(offset);
+            }
+        }
+        None
     }
 
     /// Resolves the commit OID for HEAD or a specific branch/tag.
@@ -316,6 +337,134 @@ impl GcsGitStorage {
         Ok(raw_obj)
     }
 
+    /// Reads a slice of a packfile via the BlockCache (10 MiB chunked reads).
+    pub async fn read_pack_slice(
+        &self,
+        pack_name: &str,
+        offset: u64,
+        read_len: usize,
+    ) -> Result<Vec<u8>> {
+        let storage = self.storage.clone();
+        let bucket = self.bucket.clone();
+        let p_name = pack_name.to_string();
+
+        let fetcher = move |block_offset: u64, block_len: usize| {
+            let s = storage.clone();
+            let b = bucket.clone();
+            let name = p_name.clone();
+            async move {
+                let mut reader = s
+                    .read_object(&b, &name)
+                    .set_read_range(ReadRange::segment(block_offset, block_len as u64))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("Reading pack range {block_offset}..+{} from {name}", block_len)
+                    })?;
+
+                let mut buf = Vec::with_capacity(block_len);
+                while let Some(chunk_res) = reader.next().await {
+                    let chunk = chunk_res?;
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(buf)
+            }
+        };
+
+        self.block_cache
+            .read_range(pack_name, offset, read_len, fetcher)
+            .await
+    }
+
+    /// Identifies all unique packfile blocks needed for the specified object OIDs,
+    /// and prefetches any uncached blocks concurrently from GCS.
+    pub async fn prefetch_blocks_for_objects(&self, oids: &[String]) -> Result<()> {
+        let block_size = self.block_cache.block_size() as u64;
+        let mut needed_blocks = HashSet::new();
+
+        {
+            let indexes = self.pack_indexes.read();
+            let cache = self.object_cache.read();
+            for oid in oids {
+                // If already in memory object cache, no block read is needed
+                if cache.contains_key(oid) {
+                    continue;
+                }
+
+                if let Ok(bytes) = hex::decode(oid) {
+                    if let Ok(sha) = <[u8; 20]>::try_from(bytes.as_slice()) {
+                        for idx in indexes.iter() {
+                            if let Some((offset, _)) = idx.find_offset(&sha) {
+                                let block_idx = offset / block_size;
+                                if !self.block_cache.has_block(&idx.pack_name, block_idx) {
+                                    needed_blocks.insert((idx.pack_name.clone(), block_idx));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if needed_blocks.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Prefetching {} uncached pack blocks in parallel for {} objects...",
+            needed_blocks.len(),
+            oids.len()
+        );
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+        let mut tasks = Vec::with_capacity(needed_blocks.len());
+
+        for (pack_name, block_idx) in needed_blocks {
+            let s = self.storage.clone();
+            let b = self.bucket.clone();
+            let p_name = pack_name.clone();
+            let bc = self.block_cache.clone();
+            let sem = semaphore.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                let fetcher = move |block_offset: u64, block_len: usize| {
+                    let s = s.clone();
+                    let b = b.clone();
+                    let name = p_name.clone();
+                    async move {
+                        let mut reader = s
+                            .read_object(&b, &name)
+                            .set_read_range(ReadRange::segment(block_offset, block_len as u64))
+                            .send()
+                            .await
+                            .with_context(|| {
+                                format!("Reading pack range {block_offset}..+{} from {name}", block_len)
+                            })?;
+
+                        let mut buf = Vec::with_capacity(block_len);
+                        while let Some(chunk_res) = reader.next().await {
+                            let chunk = chunk_res?;
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Ok(buf)
+                    }
+                };
+
+                bc.get_or_fetch_block(&pack_name, block_idx, &fetcher).await
+            }));
+        }
+
+        for task in futures::future::join_all(tasks).await {
+            if let Ok(Err(e)) = task {
+                tracing::warn!("Error prefetching pack block: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Reads an object located at offset in a packfile (resolving deltas if needed).
     #[async_recursion::async_recursion]
     pub async fn read_pack_object(
@@ -324,40 +473,8 @@ impl GcsGitStorage {
         offset: u64,
         estimated_len: usize,
     ) -> Result<GitRawObject> {
-        let filename = pack_name.rsplit('/').next().unwrap_or(pack_name);
-        let local_pack = self.cache_dir.join("objects").join("pack").join(filename);
-
-        // Read bytes from local packfile if cached, or range request from GCS
-        let pack_slice = if local_pack.is_file() {
-            let file = File::open(&local_pack)?;
-            let file_len = file.metadata()?.len();
-            let read_len = std::cmp::min(
-                std::cmp::max(estimated_len + 64, 4096) as u64,
-                file_len.saturating_sub(offset),
-            ) as usize;
-
-            let mut buf = vec![0u8; read_len];
-            let read_bytes = file.read_at(&mut buf, offset)?;
-            buf.truncate(read_bytes);
-            buf
-        } else {
-            // Read via GCS range request
-            let read_len = std::cmp::max(estimated_len as u64, 4096);
-            let mut reader = self
-                .storage
-                .read_object(&self.bucket, pack_name)
-                .set_read_range(ReadRange::segment(offset, read_len))
-                .send()
-                .await
-                .with_context(|| format!("Reading range {offset}..+{} from {}", read_len, pack_name))?;
-
-            let mut buf = Vec::new();
-            while let Some(chunk_res) = reader.next().await {
-                let chunk = chunk_res?;
-                buf.extend_from_slice(&chunk);
-            }
-            buf
-        };
+        let read_len = std::cmp::max(estimated_len + 64, 4096);
+        let pack_slice = self.read_pack_slice(pack_name, offset, read_len).await?;
 
         if pack_slice.is_empty() {
             return Err(anyhow!("Empty read from pack {pack_name} at offset {offset}"));
@@ -408,7 +525,8 @@ impl GcsGitStorage {
                 decoder.read_to_end(&mut delta_data)?;
 
                 // Recursively resolve base object
-                let base_obj = self.read_pack_object(pack_name, base_offset, size).await?;
+                let base_len = self.get_pack_object_len(pack_name, base_offset).unwrap_or(size);
+                let base_obj = self.read_pack_object(pack_name, base_offset, base_len).await?;
                 let resolved = apply_git_delta(&base_obj.data, &delta_data)?;
 
                 Ok(GitRawObject {

@@ -7,3 +7,5 @@ recovered-changes-*.pack
 recovered-changes-*.idx
 linux/
 linux2/
+linux-full/
+*.blocks/

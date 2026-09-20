@@ -150,6 +150,22 @@ impl PackIndex {
         self.shas.len()
     }
 
+    /// Gets the length in bytes of the object at the specified offset by finding
+    /// the distance to the next object in the packfile.
+    pub fn get_object_len_at_offset(&self, offset: u64) -> Option<usize> {
+        match self.sorted_offsets.binary_search(&offset) {
+            Ok(sorted_idx) => {
+                if sorted_idx + 1 < self.sorted_offsets.len() {
+                    let next_off = self.sorted_offsets[sorted_idx + 1];
+                    Some((next_off - offset) as usize)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
     pub fn pack_sha_hex(&self) -> String {
         hex::encode(self.pack_sha)
     }
