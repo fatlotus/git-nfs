@@ -20,11 +20,21 @@ impl NfsMounter {
                 .with_context(|| format!("Creating mount directory {mount_str}"))?;
         }
 
+        // Clean up any stale or dead mount from a previous crashed session
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("/sbin/umount").arg("-f").arg(&mount_str).output();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = Command::new("umount").arg("-f").arg(&mount_str).output();
+        }
+
         // On macOS: use mount_nfs
         #[cfg(target_os = "macos")]
         {
             let options = format!(
-                "rw,tcp,noatime,nolocks,locallocks,port={port},mountport={port}"
+                "rw,tcp,noatime,nolocks,locallocks,soft,timeo=30,port={port},mountport={port}"
             );
             let share = format!("{ip}:/");
 

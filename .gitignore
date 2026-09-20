@@ -1,4 +1,9 @@
 /target
 changes-*.pack
 changes-*.idx
+pack-*.pack
+pack-*.idx
+recovered-changes-*.pack
+recovered-changes-*.idx
 linux/
+linux2/

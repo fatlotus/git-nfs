@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package git_nfs.wal;
+
+enum InodeType {
+  REGULAR_FILE = 0;
+  DIRECTORY = 1;
+  SYMLINK = 2;
+  EXECUTABLE_FILE = 3;
+}
+
+message WalHeader {
+  string repo_url = 1;
+  string base_commit_oid = 2;
+  string author = 3;
+  string commit_message = 4;
+  uint64 started_at_unix_secs = 5;
+  uint64 wal_seq = 6;
+}
+
+message CreateFileMutation {
+  string path = 1;
+  InodeType inode_type = 2;
+  uint32 mode = 3;
+}
+
+message MkdirMutation {
+  string path = 1;
+}
+
+message WriteMutation {
+  string path = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+}
+
+message TruncateMutation {
+  string path = 1;
+  uint64 new_size = 2;
+}
+
+message RemoveMutation {
+  string path = 1;
+}
+
+message RenameMutation {
+  string from_path = 1;
+  string to_path = 2;
+}
+
+message WalEntry {
+  uint64 seq = 1;
+  uint64 timestamp_unix_nanos = 2;
+  oneof payload {
+    WalHeader header = 3;
+    CreateFileMutation create_file = 4;
+    MkdirMutation mkdir = 5;
+    WriteMutation write = 6;
+    TruncateMutation truncate = 7;
+    RemoveMutation remove = 8;
+    RenameMutation rename = 9;
+  }
+}

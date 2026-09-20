@@ -10,11 +10,16 @@ use crate::git::tree::TreeEntryMode;
 use crate::git::GitEngine;
 use crate::staging::StagingStore;
 use crate::vfs::inode::{VfsManager, VfsNode, ROOT_INODE};
+use crate::wal::{
+    CreateFileMutation, InodeType, MkdirMutation, RemoveMutation, RenameMutation,
+    TruncateMutation, WalManager, WalPayload, WriteMutation,
+};
 
 pub struct GitNfsFileSystem {
     vfs: Arc<VfsManager>,
     git_engine: Arc<GitEngine>,
     staging: Arc<StagingStore>,
+    wal: Option<Arc<WalManager>>,
     uid: u32,
     gid: u32,
     epoch_seconds: u32,
@@ -25,6 +30,7 @@ impl GitNfsFileSystem {
         vfs: Arc<VfsManager>,
         git_engine: Arc<GitEngine>,
         staging: Arc<StagingStore>,
+        wal: Option<Arc<WalManager>>,
     ) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -37,6 +43,7 @@ impl GitNfsFileSystem {
             vfs,
             git_engine,
             staging,
+            wal,
             uid,
             gid,
             epoch_seconds,
@@ -170,6 +177,17 @@ impl NFSFileSystem for GitNfsFileSystem {
                     nfsstat3::NFS3ERR_IO
                 })?;
             self.vfs.update_file_size(id, new_size);
+
+            if let Some(ref wal) = self.wal {
+                if let Ok(path) = self.vfs.get_path(id) {
+                    let _ = wal
+                        .log_mutation(WalPayload::Truncate(TruncateMutation {
+                            path,
+                            new_size,
+                        }))
+                        .await;
+                }
+            }
         }
 
         Ok(self.node_to_fattr3(&node))
@@ -243,25 +261,28 @@ impl NFSFileSystem for GitNfsFileSystem {
             None
         };
 
-        let actual_offset = if let Some(ref base) = base_data {
-            if offset > base.len() as u64 {
-                base.len() as u64
-            } else {
-                offset
-            }
-        } else {
-            offset
-        };
-
         let new_len = self
             .staging
-            .write_at(id, actual_offset, data, base_data.as_deref())
+            .write_at(id, offset, data, base_data.as_deref())
             .map_err(|e| {
                 warn!("Failed to write to staging for node {id}: {e}");
                 nfsstat3::NFS3ERR_IO
             })?;
 
         self.vfs.update_file_size(id, new_len);
+
+        if let Some(ref wal) = self.wal {
+            if let Ok(path) = self.vfs.get_path(id) {
+                let _ = wal
+                    .log_mutation(WalPayload::Write(WriteMutation {
+                        path,
+                        offset,
+                        data: data.to_vec(),
+                    }))
+                    .await;
+            }
+        }
+
         Ok(self.node_to_fattr3(&node))
     }
 
@@ -275,6 +296,22 @@ impl NFSFileSystem for GitNfsFileSystem {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
         self.staging.create_file(node.id).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        if let Some(ref wal) = self.wal {
+            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+            let path = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            let _ = wal
+                .log_mutation(WalPayload::CreateFile(CreateFileMutation {
+                    path,
+                    inode_type: InodeType::RegularFile as i32,
+                    mode: 0o100644,
+                }))
+                .await;
+        }
 
         let attr = self.node_to_fattr3(&node);
         Ok((node.id, attr))
@@ -291,6 +328,22 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         self.staging.create_file(node.id).map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+        if let Some(ref wal) = self.wal {
+            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+            let path = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            let _ = wal
+                .log_mutation(WalPayload::CreateFile(CreateFileMutation {
+                    path,
+                    inode_type: InodeType::RegularFile as i32,
+                    mode: 0o100644,
+                }))
+                .await;
+        }
+
         Ok(node.id)
     }
 
@@ -302,6 +355,18 @@ impl NFSFileSystem for GitNfsFileSystem {
             .vfs
             .mkdir(dirid, &name)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        if let Some(ref wal) = self.wal {
+            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+            let path = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            let _ = wal
+                .log_mutation(WalPayload::Mkdir(MkdirMutation { path }))
+                .await;
+        }
 
         let attr = self.node_to_fattr3(&node);
         Ok((node.id, attr))
@@ -317,6 +382,19 @@ impl NFSFileSystem for GitNfsFileSystem {
             .map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
 
         self.staging.mark_deleted(node.id);
+
+        if let Some(ref wal) = self.wal {
+            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+            let path = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            let _ = wal
+                .log_mutation(WalPayload::Remove(RemoveMutation { path }))
+                .await;
+        }
+
         Ok(())
     }
 
@@ -331,9 +409,33 @@ impl NFSFileSystem for GitNfsFileSystem {
         let to_name = String::from_utf8_lossy(&to_filename.0).to_string();
         debug!("NFS RENAME: {from_name} -> {to_name}");
 
+        let from_parent = self.vfs.get_path(from_dirid).unwrap_or_default();
+        let from_path = if from_parent.is_empty() {
+            from_name.clone()
+        } else {
+            format!("{from_parent}/{from_name}")
+        };
+        let to_parent = self.vfs.get_path(to_dirid).unwrap_or_default();
+        let to_path = if to_parent.is_empty() {
+            to_name.clone()
+        } else {
+            format!("{to_parent}/{to_name}")
+        };
+
         self.vfs
             .rename(from_dirid, &from_name, to_dirid, &to_name)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        if let Some(ref wal) = self.wal {
+            let _ = wal
+                .log_mutation(WalPayload::Rename(RenameMutation {
+                    from_path,
+                    to_path,
+                }))
+                .await;
+        }
+
+        Ok(())
     }
 
     async fn readdir(

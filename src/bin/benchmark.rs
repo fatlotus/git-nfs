@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
     }
 
     let after_duration = start_after.elapsed();
-    let after_requests = engine.http_client().request_count();
+    let after_requests = engine.http_client().unwrap().request_count();
     let memory_hits = engine.memory_cache().hits();
 
     println!("  [AFTER] Total HTTP Requests  : {after_requests}");
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
     }
     println!("  [RESTART] Total Bytes Read   : {restart_bytes} bytes");
     let restart_duration = start_restart.elapsed();
-    let restart_requests = restart_engine.http_client().request_count();
+    let restart_requests = restart_engine.http_client().unwrap().request_count();
 
     println!("  [RESTART] Total HTTP Requests: {restart_requests} (0 tree / 0 blob network requests!)");
     println!("  [RESTART] Total Time Elapsed : {:.2?}", restart_duration);
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
     staging.write_at(makefile_id, 0, b"# Custom Linux Kernel Patch\n", None)?;
 
     let base_commit = restart_engine.base_commit_oid().expect("base commit");
-    let (new_commit_oid, objects) = git_nfs::git::builder::rebuild_git_objects(
+    let (new_commit_oid, _new_root_tree_oid, objects) = git_nfs::git::builder::rebuild_git_objects(
         &vfs,
         &staging,
         &restart_engine,

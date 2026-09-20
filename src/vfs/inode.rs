@@ -358,4 +358,81 @@ impl VfsManager {
             .cloned()
             .collect()
     }
+
+    /// Reconstructs the repository-relative path for a given node ID.
+    /// Returns "" for the root inode.
+    pub fn get_path(&self, node_id: u64) -> Result<String> {
+        if node_id == ROOT_INODE {
+            return Ok(String::new());
+        }
+
+        let mut components = Vec::new();
+        let mut curr = node_id;
+
+        while curr != ROOT_INODE {
+            let node = self
+                .nodes
+                .read()
+                .get(&curr)
+                .cloned()
+                .ok_or_else(|| anyhow!("Node {curr} not found in VFS"))?;
+
+            let name = node.name.read().clone();
+            components.push(name);
+
+            let parent = *node.parent_id.read();
+            if parent == curr {
+                break;
+            }
+            curr = parent;
+        }
+
+        components.reverse();
+        Ok(components.join("/"))
+    }
+
+    /// Resolves a repository-relative path (e.g. "foo/bar/baz.txt") to an inode ID.
+    pub fn lookup_path(&self, path: &str) -> Result<u64> {
+        let clean = path.trim_matches('/');
+        if clean.is_empty() {
+            return Ok(ROOT_INODE);
+        }
+
+        let mut curr = ROOT_INODE;
+        for part in clean.split('/') {
+            if part.is_empty() || part == "." {
+                continue;
+            }
+            curr = self.lookup(curr, part)?;
+        }
+
+        Ok(curr)
+    }
+
+    /// Resolves or creates all parent directories along a path, returning
+    /// (parent_dir_id, basename).
+    pub fn ensure_parent_dirs(&self, path: &str) -> Result<(u64, String)> {
+        let clean = path.trim_matches('/');
+        let parts: Vec<&str> = clean.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.is_empty() {
+            return Err(anyhow!("Cannot resolve parent of empty path"));
+        }
+
+        let basename = parts[parts.len() - 1].to_string();
+        let mut curr = ROOT_INODE;
+
+        for &part in &parts[..parts.len() - 1] {
+            match self.lookup(curr, part) {
+                Ok(child_id) => {
+                    curr = child_id;
+                }
+                Err(_) => {
+                    let new_dir = self.mkdir(curr, part)?;
+                    curr = new_dir.id;
+                }
+            }
+        }
+
+        Ok((curr, basename))
+    }
 }

@@ -45,7 +45,7 @@ pub async fn rebuild_git_objects(
     base_commit_oid: &str,
     author: &str,
     commit_message: &str,
-) -> Result<(String, Vec<GitObjectToPack>)> {
+) -> Result<(String, String, Vec<GitObjectToPack>)> {
     let mut new_objects: HashMap<String, GitObjectToPack> = HashMap::new();
 
     // 1. Process all staged (modified or created) files into new Git blobs
@@ -133,7 +133,7 @@ pub async fn rebuild_git_objects(
         objects_list.len()
     );
 
-    Ok((new_commit_oid, objects_list))
+    Ok((new_commit_oid, new_root_tree_oid, objects_list))
 }
 
 fn rebuild_tree_recursive(
@@ -258,7 +258,7 @@ mod tests {
         staging.write_at(file_a.id, 0, b"hello world", None)?;
 
         let git_engine_ref = vfs.git_engine();
-        let (commit_oid, objects) = rebuild_git_objects(
+        let (commit_oid, root_tree_oid, objects) = rebuild_git_objects(
             &vfs,
             &staging,
             git_engine_ref,
@@ -269,6 +269,7 @@ mod tests {
         .await?;
 
         assert!(!commit_oid.is_empty());
+        assert!(!root_tree_oid.is_empty());
 
         // Objects must ONLY contain:
         // 1. file_a blob ("hello world")

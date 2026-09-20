@@ -19,13 +19,24 @@ struct ObjectEntry {
 pub struct PackWriter;
 
 impl PackWriter {
+    /// Generates in-memory pack and index file bytes for a list of Git objects,
+    /// returning (pack_bytes, idx_bytes, pack_sha_hex).
+    pub fn create_pack_and_index_bytes(
+        objects: &[GitObjectToPack],
+    ) -> Result<(Vec<u8>, Vec<u8>, String)> {
+        let (pack_data, entries, pack_sha) = Self::create_pack_data(objects)?;
+        let idx_data = Self::create_idx_v2_data(entries, &pack_sha)?;
+        let pack_sha_hex = hex::encode(pack_sha);
+        Ok((pack_data, idx_data, pack_sha_hex))
+    }
+
     /// Writes a list of Git objects into a .pack file and its companion .idx file.
     pub fn write_pack_and_index(
         pack_path: &Path,
         idx_path: &Path,
         objects: &[GitObjectToPack],
     ) -> Result<()> {
-        let (pack_data, entries, pack_sha) = Self::create_pack_data(objects)?;
+        let (pack_data, idx_data, _pack_sha) = Self::create_pack_and_index_bytes(objects)?;
 
         // Write .pack file
         let mut pack_file = File::create(pack_path)
@@ -33,8 +44,7 @@ impl PackWriter {
         pack_file.write_all(&pack_data)?;
         pack_file.flush()?;
 
-        // Create and write .idx file
-        let idx_data = Self::create_idx_v2_data(entries, &pack_sha)?;
+        // Write .idx file
         let mut idx_file = File::create(idx_path)
             .with_context(|| format!("Creating index file at {}", idx_path.display()))?;
         idx_file.write_all(&idx_data)?;
