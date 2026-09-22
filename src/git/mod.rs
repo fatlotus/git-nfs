@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod commit_message;
 pub mod gcs_storage;
 pub mod idx;
 pub mod pack;
@@ -6,6 +7,8 @@ pub mod pack_writer;
 pub mod protocol;
 pub mod smart_http;
 pub mod tree;
+
+pub use commit_message::generate_commit_message;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

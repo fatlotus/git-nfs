@@ -16,8 +16,10 @@ When you modify files or directories over NFS, `git-nfs` records changes in a lo
    - Changes are staged in `~/.cache/git-nfs/<repo>/staging/` and immediately visible over NFS.
 3. **macOS Finder Friendly**:
    - Intercepts and filters Apple metadata (`.DS_Store`, `._*`, `.Spotlight-V100`) so your Git tree is never polluted with macOS junk.
-4. **Automatic Git Packfile Generation**:
-   - On `Ctrl+C`, automatically builds canonical Git trees, synthesizes a commit pointing to the original remote commit, and writes a valid Git Packfile v2 (`.pack`) and index (`.idx`).
+4. **Automatic Commits & Git Packfile Generation**:
+   - Automatically commits changes after 30 seconds of write inactivity and upon unmount (`Ctrl+C`).
+   - Dynamically auto-generates informative commit messages based on the set of changed files and directories (no manual commit message needed!).
+   - Automatically builds canonical Git trees, synthesizes a commit pointing to the base commit, and writes a valid Git Packfile v2 (`.pack`) and index (`.idx`).
    - Verified with standard `git verify-pack -v`.
 5. **Zero Kernel Extensions or Sudo**:
    - Runs purely in userspace on unprivileged localhost ports using native `/sbin/mount_nfs`.
@@ -101,7 +103,6 @@ Options:
       --repo-prefix <REPO_PREFIX>      Optional explicit object prefix for Git repository on GCS (e.g. linux/)
       --cache-dir <CACHE_DIR>          Custom blob cache and staging directory
       --output-pack <OUTPUT_PACK>      Custom path for generated changes packfile
-      --commit-message <MSG>           Commit message for generated commit [default: "Changes made via git-nfs proxy"]
       --author <AUTHOR>                Author signature (e.g. "Name <email>") [defaults to git config]
       --no-mount                       Run server only without executing mount_nfs
       --wal-bucket <WAL_BUCKET>        GCS Rapid Bucket for appendable Write-Ahead Logging (defaults to repo bucket for GCS repos)

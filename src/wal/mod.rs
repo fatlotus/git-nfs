@@ -24,7 +24,7 @@ use crate::vfs::inode::VfsManager;
 
 pub struct WalManager {
     backend: Arc<dyn WalBackend>,
-    active_seq: u64,
+    active_seq: AtomicU64,
     active_writer: Arc<Mutex<Option<Box<dyn ActiveWalWriter>>>>,
     entry_seq: AtomicU64,
 }
@@ -33,7 +33,7 @@ impl WalManager {
     pub fn new(backend: Arc<dyn WalBackend>, active_seq: u64) -> Self {
         Self {
             backend,
-            active_seq,
+            active_seq: AtomicU64::new(active_seq),
             active_writer: Arc::new(Mutex::new(None)),
             entry_seq: AtomicU64::new(1),
         }
@@ -44,7 +44,13 @@ impl WalManager {
     }
 
     pub fn active_seq(&self) -> u64 {
-        self.active_seq
+        self.active_seq.load(Ordering::SeqCst)
+    }
+
+    /// Advances to the next sequential WAL log and resets the entry counter.
+    pub fn advance_seq(&self) -> u64 {
+        self.entry_seq.store(1, Ordering::SeqCst);
+        self.active_seq.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Opens the active WAL writer for this session and writes the initial header.
@@ -55,7 +61,8 @@ impl WalManager {
         author: &str,
         commit_message: &str,
     ) -> Result<()> {
-        let mut writer = self.backend.open_writer(self.active_seq).await?;
+        let seq = self.active_seq.load(Ordering::SeqCst);
+        let mut writer = self.backend.open_writer(seq).await?;
 
         let now_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -74,7 +81,7 @@ impl WalManager {
                 author: author.to_string(),
                 commit_message: commit_message.to_string(),
                 started_at_unix_secs: now_secs,
-                wal_seq: self.active_seq,
+                wal_seq: seq,
             })),
         };
 
@@ -82,7 +89,7 @@ impl WalManager {
         writer.flush().await?;
 
         *self.active_writer.lock().await = Some(writer);
-        info!("Active WAL {}.log initialized and durably flushed", self.active_seq);
+        info!("Active WAL {seq}.log initialized and durably flushed");
         Ok(())
     }
 
@@ -109,8 +116,9 @@ impl WalManager {
     pub async fn finalize_active_wal(&self) -> Result<()> {
         let mut lock = self.active_writer.lock().await;
         if let Some(writer) = lock.take() {
+            let seq = self.active_seq.load(Ordering::SeqCst);
             writer.finalize().await.context("Finalizing active WAL")?;
-            info!("Finalized active WAL {}.log", self.active_seq);
+            info!("Finalized active WAL {seq}.log");
         }
         Ok(())
     }

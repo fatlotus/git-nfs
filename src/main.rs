@@ -15,6 +15,7 @@ use git_nfs::nfs::fs::GitNfsFileSystem;
 use git_nfs::nfs::start_nfs_server;
 use git_nfs::staging::StagingStore;
 use git_nfs::vfs::inode::VfsManager;
+use git_nfs::wal::recovery::RecoveredPackResult;
 use git_nfs::wal::{GcsRapidWalBackend, LocalWalBackend, WalBackend, WalManager};
 
 #[derive(Parser, Debug)]
@@ -52,10 +53,6 @@ struct Args {
     /// Optional path for output Git packfile when changes are made
     #[arg(long)]
     output_pack: Option<PathBuf>,
-
-    /// Commit message for generated commit
-    #[arg(long, default_value = "Changes made via git-nfs proxy")]
-    commit_message: String,
 
     /// Author signature (e.g. "User Name <user@example.com>")
     #[arg(long)]
@@ -231,7 +228,7 @@ async fn main() -> Result<()> {
         &current_root_oid,
         &current_base_commit_oid,
         &author,
-        &args.commit_message,
+        "",
         &base_cache_dir,
         args.branch.as_deref(),
     )
@@ -288,7 +285,7 @@ async fn main() -> Result<()> {
             &repo_identifier,
             &current_base_commit_oid,
             &author,
-            &args.commit_message,
+            "",
         )
         .await
         .context("Initializing active WAL")?;
@@ -303,6 +300,10 @@ async fn main() -> Result<()> {
         staging.clone(),
         Some(wal_manager.clone()),
     );
+
+    let commit_lock = nfs_fs.commit_lock();
+    let last_mutation_time = nfs_fs.last_mutation_time();
+    let has_uncommitted_changes = nfs_fs.has_uncommitted_changes();
 
     // 9. Start NFS Server
     let server_info = start_nfs_server("127.0.0.1", args.port, nfs_fs)
@@ -325,10 +326,98 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Shared OIDs protected by mutex for auto-commit background task and main thread
+    let shared_root_oid = Arc::new(tokio::sync::Mutex::new(current_root_oid.clone()));
+    let shared_base_commit_oid = Arc::new(tokio::sync::Mutex::new(current_base_commit_oid.clone()));
+
+    let stop_signal = Arc::new(tokio::sync::Notify::new());
+    let stop_signal_clone = stop_signal.clone();
+
+    let auto_wal_mgr = wal_manager.clone();
+    let auto_backend = wal_backend.clone();
+    let auto_engine = git_engine.clone();
+    let auto_staging = staging.clone();
+    let auto_lock = commit_lock.clone();
+    let auto_last_mut = last_mutation_time.clone();
+    let auto_has_uncommitted = has_uncommitted_changes.clone();
+    let auto_author = author.clone();
+    let auto_repo_id = repo_identifier.clone();
+    let auto_cache_dir = base_cache_dir.clone();
+    let auto_branch = args.branch.clone();
+    let auto_output_pack = args.output_pack.clone();
+    let auto_root_oid = shared_root_oid.clone();
+    let auto_base_oid = shared_base_commit_oid.clone();
+
+    // Background task: automatically commits after 30 seconds of write inactivity
+    let auto_commit_handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = stop_signal_clone.notified() => {
+                    break;
+                }
+                _ = ticker.tick() => {
+                    if !auto_has_uncommitted.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    let last = auto_last_mut.load(std::sync::atomic::Ordering::Relaxed);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+
+                    if now >= last + 30 {
+                        let _guard = auto_lock.write().await;
+                        if auto_has_uncommitted.load(std::sync::atomic::Ordering::Relaxed) {
+                            let mut root = auto_root_oid.lock().await;
+                            let mut base = auto_base_oid.lock().await;
+
+                            match perform_commit(
+                                &auto_wal_mgr,
+                                &auto_backend,
+                                &auto_engine,
+                                &auto_staging,
+                                &mut *root,
+                                &mut *base,
+                                &auto_author,
+                                &auto_repo_id,
+                                &auto_cache_dir,
+                                auto_branch.as_deref(),
+                                auto_output_pack.as_ref(),
+                                false,
+                            ).await {
+                                Ok(Some(res)) => {
+                                    auto_has_uncommitted.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    println!();
+                                    println!("===============================================================");
+                                    println!("🎉 Automatically committed changes (30s inactivity):");
+                                    println!("📌 New Commit SHA : {}", res.commit_oid);
+                                    println!("📦 Packfile       : pack-{}.pack", res.pack_sha);
+                                    println!("📊 Total objects  : {}", res.objects.len());
+                                    if auto_engine.gcs_storage().is_some() {
+                                        println!("☁️  GCS Storage   : Uploaded pack-{}.pack & .idx, updated refs on GCS", res.pack_sha);
+                                    }
+                                    println!("===============================================================");
+                                    println!();
+                                }
+                                Ok(None) => {
+                                    auto_has_uncommitted.store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Auto-commit error: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     println!();
     println!("🎉 Git repository successfully mounted at: {}", args.mountpoint.display());
     println!("👉 You can now browse & EDIT it with Finder or Terminal: open {}", args.mountpoint.display());
-    println!("👉 Press Ctrl+C to unmount and automatically commit your changes.");
+    println!("👉 Changes are automatically committed after 30 seconds of inactivity or upon Ctrl+C.");
     println!();
 
     // Wait for SIGINT (Ctrl+C) or SIGTERM (kill)
@@ -347,30 +436,39 @@ async fn main() -> Result<()> {
     }
     info!("Shutting down Git NFS server...");
 
+    // Stop background auto-commit task
+    stop_signal.notify_one();
+    let _ = auto_commit_handle.await;
+
     // Cleanly unmount first so no more writes arrive
     if let Some(m) = mounter {
         m.unmount();
     }
 
-    // 11. Finalize active WAL
-    wal_manager.finalize_active_wal().await.context("Finalizing active WAL")?;
+    // Final shutdown commit
+    let _guard = commit_lock.write().await;
+    let mut root_guard = shared_root_oid.lock().await;
+    let mut base_guard = shared_base_commit_oid.lock().await;
 
-    // 12. Exercise crash recovery code to rebuild packfile from WAL on clean shutdown!
     println!();
-    info!("Rebuilding packfile from WAL using crash recovery engine...");
+    info!("Checking for final uncommitted changes...");
 
-    let recovered = WalManager::recover_and_replay_uncommitted(
+    let recovered = perform_commit(
+        &wal_manager,
         &wal_backend,
         &git_engine,
-        &current_root_oid,
-        &current_base_commit_oid,
+        &staging,
+        &mut *root_guard,
+        &mut *base_guard,
         &author,
-        &args.commit_message,
+        &repo_identifier,
         &base_cache_dir,
         args.branch.as_deref(),
+        args.output_pack.as_ref(),
+        true,
     )
     .await
-    .context("Replaying uncommitted WAL via crash recovery engine")?;
+    .context("Performing shutdown commit")?;
 
     if let Some(res) = recovered {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -379,17 +477,12 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| cwd.join(format!("pack-{}.pack", res.pack_sha)));
         let idx_path = pack_path.with_extension("idx");
 
-        std::fs::write(&pack_path, &res.pack_data)
-            .with_context(|| format!("Writing packfile to {}", pack_path.display()))?;
-        std::fs::write(&idx_path, &res.idx_data)
-            .with_context(|| format!("Writing index file to {}", idx_path.display()))?;
-
         println!();
         println!("===============================================================");
         println!("🎉 Successfully generated and published Git commit from WAL!");
         println!("===============================================================");
         println!("📌 New Commit SHA : {}", res.commit_oid);
-        println!("📌 Base Commit SHA: {current_base_commit_oid}");
+        println!("📌 Base Commit SHA: {}", *base_guard);
         println!("📦 Packfile       : {}", pack_path.display());
         println!("📄 Index file     : {}", idx_path.display());
         println!("📊 Total objects  : {}", res.objects.len());
@@ -405,4 +498,86 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn perform_commit(
+    wal_manager: &Arc<WalManager>,
+    wal_backend: &Arc<dyn WalBackend>,
+    git_engine: &Arc<GitEngine>,
+    staging: &Arc<StagingStore>,
+    current_root_oid: &mut String,
+    current_base_commit_oid: &mut String,
+    author: &str,
+    repo_identifier: &str,
+    base_cache_dir: &std::path::Path,
+    branch: Option<&str>,
+    output_pack: Option<&PathBuf>,
+    is_shutdown: bool,
+) -> Result<Option<RecoveredPackResult>> {
+    wal_manager
+        .finalize_active_wal()
+        .await
+        .context("Finalizing active WAL")?;
+
+    let recovered = WalManager::recover_and_replay_uncommitted(
+        wal_backend,
+        git_engine,
+        current_root_oid,
+        current_base_commit_oid,
+        author,
+        "",
+        base_cache_dir,
+        branch,
+    )
+    .await
+    .context("Replaying uncommitted WAL to build commit")?;
+
+    if let Some(ref res) = recovered {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let pack_path = output_pack
+            .cloned()
+            .unwrap_or_else(|| cwd.join(format!("pack-{}.pack", res.pack_sha)));
+        let idx_path = pack_path.with_extension("idx");
+
+        std::fs::write(&pack_path, &res.pack_data)
+            .with_context(|| format!("Writing packfile to {}", pack_path.display()))?;
+        std::fs::write(&idx_path, &res.idx_data)
+            .with_context(|| format!("Writing index file to {}", idx_path.display()))?;
+
+        git_engine.apply_recovered_objects(
+            &res.commit_oid,
+            &res.root_tree_oid,
+            &res.objects,
+        );
+        *current_root_oid = res.root_tree_oid.clone();
+        *current_base_commit_oid = res.commit_oid.clone();
+
+        staging.reset().context("Resetting staging store after commit")?;
+
+        if !is_shutdown {
+            wal_manager.advance_seq();
+            wal_manager
+                .start_active_wal(
+                    repo_identifier,
+                    current_base_commit_oid,
+                    author,
+                    "",
+                )
+                .await
+                .context("Initializing next active WAL session")?;
+        }
+    } else if !is_shutdown {
+        wal_manager.advance_seq();
+        wal_manager
+            .start_active_wal(
+                repo_identifier,
+                current_base_commit_oid,
+                author,
+                "",
+            )
+            .await
+            .context("Re-initializing active WAL session")?;
+    }
+
+    Ok(recovered)
 }

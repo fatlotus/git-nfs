@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -23,6 +24,9 @@ pub struct GitNfsFileSystem {
     uid: u32,
     gid: u32,
     epoch_seconds: u32,
+    last_mutation_time: Arc<AtomicU64>,
+    has_uncommitted_changes: Arc<AtomicBool>,
+    commit_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl GitNfsFileSystem {
@@ -47,7 +51,32 @@ impl GitNfsFileSystem {
             uid,
             gid,
             epoch_seconds,
+            last_mutation_time: Arc::new(AtomicU64::new(0)),
+            has_uncommitted_changes: Arc::new(AtomicBool::new(false)),
+            commit_lock: Arc::new(tokio::sync::RwLock::new(())),
         }
+    }
+
+    pub fn commit_lock(&self) -> Arc<tokio::sync::RwLock<()>> {
+        self.commit_lock.clone()
+    }
+
+    pub fn last_mutation_time(&self) -> Arc<AtomicU64> {
+        self.last_mutation_time.clone()
+    }
+
+    pub fn has_uncommitted_changes(&self) -> Arc<AtomicBool> {
+        self.has_uncommitted_changes.clone()
+    }
+
+    fn record_mutation(&self, path: &str) {
+        self.staging.record_changed_path(path);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_mutation_time.store(now, Ordering::Relaxed);
+        self.has_uncommitted_changes.store(true, Ordering::Relaxed);
     }
 
     fn node_to_fattr3(&self, node: &VfsNode) -> fattr3 {
@@ -155,15 +184,17 @@ impl NFSFileSystem for GitNfsFileSystem {
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         if self.staging.is_deleted(id) {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
         let node = self.vfs.get_node(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        if node.is_dir {
-            return Err(nfsstat3::NFS3ERR_ISDIR);
-        }
 
         if let set_size3::size(new_size) = setattr.size {
+            if node.is_dir {
+                return Err(nfsstat3::NFS3ERR_ISDIR);
+            }
+
             let base_data = if !self.staging.is_staged(id) {
                 self.get_base_data(&node).await
             } else {
@@ -178,8 +209,9 @@ impl NFSFileSystem for GitNfsFileSystem {
                 })?;
             self.vfs.update_file_size(id, new_size);
 
-            if let Some(ref wal) = self.wal {
-                if let Ok(path) = self.vfs.get_path(id) {
+            if let Ok(path) = self.vfs.get_path(id) {
+                self.record_mutation(&path);
+                if let Some(ref wal) = self.wal {
                     let _ = wal
                         .log_mutation(WalPayload::Truncate(TruncateMutation {
                             path,
@@ -203,16 +235,16 @@ impl NFSFileSystem for GitNfsFileSystem {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
 
-        // 1. Check if file has staged modifications
-        if let Some((buf, eof)) = self.staging.read_at(id, offset, count).map_err(|e| {
-            warn!("Failed to read from staging for node {id}: {e}");
-            nfsstat3::NFS3ERR_IO
-        })? {
-            return Ok((buf, eof));
+        // 1. Check staging first
+        if let Ok(Some((data, eof))) = self.staging.read_at(id, offset, count) {
+            return Ok((data, eof));
         }
 
-        // 2. Otherwise read from original Git blob
+        // 2. Fetch from GitEngine (cache / remote)
         let oid = node.oid.read().clone();
+        if oid.is_empty() {
+            return Ok((Vec::new(), true));
+        }
 
         // If the blob is missing from both memory and disk caches, prefetch
         // all companion files in the parent directory in a single batch request!
@@ -226,27 +258,28 @@ impl NFSFileSystem for GitNfsFileSystem {
             }
         }
 
-        let data = self.git_engine.get_blob_arc(&oid).await.map_err(|e| {
-            warn!("Failed to fetch blob {}: {e}", oid);
+        let blob_data = self.git_engine.get_blob_arc(&oid).await.map_err(|e| {
+            warn!("Failed to read blob {oid} for node {id}: {e}");
             nfsstat3::NFS3ERR_IO
         })?;
 
-        let real_size = data.len() as u64;
-        self.vfs.update_file_size(id, real_size);
+        let file_len = blob_data.len() as u64;
+        self.vfs.update_file_size(id, file_len);
 
-        if offset >= real_size {
+        if offset >= file_len {
             return Ok((Vec::new(), true));
         }
 
+        let to_read = (count as u64).min(file_len - offset) as usize;
         let start = offset as usize;
-        let end = (start + count as usize).min(data.len());
-        let slice = data[start..end].to_vec();
-        let eof = end >= data.len();
+        let slice = blob_data[start..start + to_read].to_vec();
+        let eof = (offset + to_read as u64) >= file_len;
 
         Ok((slice, eof))
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         if self.staging.is_deleted(id) {
             return Err(nfsstat3::NFS3ERR_NOENT);
         }
@@ -271,8 +304,9 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         self.vfs.update_file_size(id, new_len);
 
-        if let Some(ref wal) = self.wal {
-            if let Ok(path) = self.vfs.get_path(id) {
+        if let Ok(path) = self.vfs.get_path(id) {
+            self.record_mutation(&path);
+            if let Some(ref wal) = self.wal {
                 let _ = wal
                     .log_mutation(WalPayload::Write(WriteMutation {
                         path,
@@ -287,6 +321,7 @@ impl NFSFileSystem for GitNfsFileSystem {
     }
 
     async fn create(&self, dirid: fileid3, filename: &filename3, _attr: sattr3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         let name = String::from_utf8_lossy(&filename.0).to_string();
         debug!("NFS CREATE: {name} in dir {dirid}");
 
@@ -297,13 +332,15 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         self.staging.create_file(node.id).map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+        let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+        let path = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        self.record_mutation(&path);
+
         if let Some(ref wal) = self.wal {
-            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
-            let path = if parent_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{parent_path}/{name}")
-            };
             let _ = wal
                 .log_mutation(WalPayload::CreateFile(CreateFileMutation {
                     path,
@@ -318,6 +355,7 @@ impl NFSFileSystem for GitNfsFileSystem {
     }
 
     async fn create_exclusive(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         let name = String::from_utf8_lossy(&filename.0).to_string();
         debug!("NFS CREATE_EXCLUSIVE: {name} in dir {dirid}");
 
@@ -328,13 +366,15 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         self.staging.create_file(node.id).map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+        let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+        let path = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        self.record_mutation(&path);
+
         if let Some(ref wal) = self.wal {
-            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
-            let path = if parent_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{parent_path}/{name}")
-            };
             let _ = wal
                 .log_mutation(WalPayload::CreateFile(CreateFileMutation {
                     path,
@@ -348,6 +388,7 @@ impl NFSFileSystem for GitNfsFileSystem {
     }
 
     async fn mkdir(&self, dirid: fileid3, dirname: &filename3) -> Result<(fileid3, fattr3), nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         let name = String::from_utf8_lossy(&dirname.0).to_string();
         debug!("NFS MKDIR: {name} in dir {dirid}");
 
@@ -356,13 +397,15 @@ impl NFSFileSystem for GitNfsFileSystem {
             .mkdir(dirid, &name)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
 
+        let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+        let path = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        self.record_mutation(&path);
+
         if let Some(ref wal) = self.wal {
-            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
-            let path = if parent_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{parent_path}/{name}")
-            };
             let _ = wal
                 .log_mutation(WalPayload::Mkdir(MkdirMutation { path }))
                 .await;
@@ -373,6 +416,7 @@ impl NFSFileSystem for GitNfsFileSystem {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         let name = String::from_utf8_lossy(&filename.0).to_string();
         debug!("NFS REMOVE: {name} in dir {dirid}");
 
@@ -383,13 +427,15 @@ impl NFSFileSystem for GitNfsFileSystem {
 
         self.staging.mark_deleted(node.id);
 
+        let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
+        let path = if parent_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+        self.record_mutation(&path);
+
         if let Some(ref wal) = self.wal {
-            let parent_path = self.vfs.get_path(dirid).unwrap_or_default();
-            let path = if parent_path.is_empty() {
-                name.clone()
-            } else {
-                format!("{parent_path}/{name}")
-            };
             let _ = wal
                 .log_mutation(WalPayload::Remove(RemoveMutation { path }))
                 .await;
@@ -405,6 +451,7 @@ impl NFSFileSystem for GitNfsFileSystem {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        let _guard = self.commit_lock.read().await;
         let from_name = String::from_utf8_lossy(&from_filename.0).to_string();
         let to_name = String::from_utf8_lossy(&to_filename.0).to_string();
         debug!("NFS RENAME: {from_name} -> {to_name}");
@@ -425,6 +472,9 @@ impl NFSFileSystem for GitNfsFileSystem {
         self.vfs
             .rename(from_dirid, &from_name, to_dirid, &to_name)
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+
+        self.record_mutation(&from_path);
+        self.record_mutation(&to_path);
 
         if let Some(ref wal) = self.wal {
             let _ = wal
@@ -537,3 +587,90 @@ impl NFSFileSystem for GitNfsFileSystem {
         Ok(nfspath3::from((*data).clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_setattr_directory_permits_non_size_attrs() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let git_engine = Arc::new(GitEngine::new("https://example.com/repo.git", Some(temp.path()))?);
+        let staging = Arc::new(StagingStore::new(temp.path())?);
+        let vfs = Arc::new(VfsManager::new(git_engine.clone(), "0000000000000000000000000000000000000000"));
+        let nfs = GitNfsFileSystem::new(vfs.clone(), git_engine, staging, None);
+
+        // 1. Create a directory via NFS
+        let dir_name = nfsstring(b"test_dir".to_vec());
+        let (dir_id, attr) = nfs.mkdir(ROOT_INODE, &dir_name).await
+            .expect("mkdir must succeed");
+        assert!(matches!(attr.ftype, ftype3::NF3DIR));
+
+        // 2. Setting timestamps/mode with size=Void must succeed
+        let sattr = sattr3 {
+            mode: set_mode3::mode(0o755),
+            uid: set_uid3::Void,
+            gid: set_gid3::Void,
+            size: set_size3::Void,
+            atime: set_atime::SET_TO_SERVER_TIME,
+            mtime: set_mtime::SET_TO_SERVER_TIME,
+        };
+        let res = nfs.setattr(dir_id, sattr).await;
+        assert!(res.is_ok(), "setattr with non-size attributes on directory should succeed, got {res:?}");
+        let new_attr = res.unwrap();
+        assert!(matches!(new_attr.ftype, ftype3::NF3DIR));
+
+        // 3. Attempting to set size on a directory must fail with NFS3ERR_ISDIR
+        let sattr_with_size = sattr3 {
+            mode: set_mode3::Void,
+            uid: set_uid3::Void,
+            gid: set_gid3::Void,
+            size: set_size3::size(100),
+            atime: set_atime::DONT_CHANGE,
+            mtime: set_mtime::DONT_CHANGE,
+        };
+        let err = nfs.setattr(dir_id, sattr_with_size).await
+            .expect_err("resizing directory must fail with NFS3ERR_ISDIR");
+        assert!(matches!(err, nfsstat3::NFS3ERR_ISDIR));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_setattr_file_allows_truncation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let git_engine = Arc::new(GitEngine::new("https://example.com/repo.git", Some(temp.path()))?);
+        let staging = Arc::new(StagingStore::new(temp.path())?);
+        let vfs = Arc::new(VfsManager::new(git_engine.clone(), "0000000000000000000000000000000000000000"));
+        let nfs = GitNfsFileSystem::new(vfs.clone(), git_engine, staging, None);
+
+        // Create a file and write data
+        let file_name = nfsstring(b"file.txt".to_vec());
+        let (file_id, _) = nfs.create(ROOT_INODE, &file_name, sattr3::default()).await
+            .expect("create file must succeed");
+        nfs.write(file_id, 0, b"hello world").await
+            .expect("write must succeed");
+
+        let attr = nfs.getattr(file_id).await.expect("getattr must succeed");
+        assert_eq!(attr.size, 11);
+
+        // Truncate file via setattr
+        let sattr = sattr3 {
+            mode: set_mode3::Void,
+            uid: set_uid3::Void,
+            gid: set_gid3::Void,
+            size: set_size3::size(5),
+            atime: set_atime::DONT_CHANGE,
+            mtime: set_mtime::DONT_CHANGE,
+        };
+        let res = nfs.setattr(file_id, sattr).await.expect("setattr on file must succeed");
+        assert_eq!(res.size, 5);
+
+        let (read_data, _) = nfs.read(file_id, 0, 100).await.expect("read must succeed");
+        assert_eq!(read_data, b"hello");
+
+        Ok(())
+    }
+}
+

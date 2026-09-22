@@ -105,6 +105,20 @@ pub async fn rebuild_git_objects(
     )?;
 
     // 4. Construct new Commit Object
+    let effective_commit_message = if !commit_message.trim().is_empty() {
+        commit_message.to_string()
+    } else {
+        let mut paths = staging.list_changed_paths();
+        if paths.is_empty() {
+            for &id in staged_node_ids.iter().chain(deleted_node_ids.iter()) {
+                if let Ok(p) = vfs.get_path(id) {
+                    paths.push(p);
+                }
+            }
+        }
+        crate::git::commit_message::generate_commit_message(&paths)
+    };
+
     let timestamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -112,7 +126,7 @@ pub async fn rebuild_git_objects(
 
     let commit_content = format!(
         "tree {}\nparent {}\nauthor {} {} +0000\ncommitter {} {} +0000\n\n{}\n",
-        new_root_tree_oid, base_commit_oid, author, timestamp, author, timestamp, commit_message
+        new_root_tree_oid, base_commit_oid, author, timestamp, author, timestamp, effective_commit_message
     );
     let commit_bytes = commit_content.into_bytes();
     let new_commit_oid = compute_git_sha1(ObjectType::Commit, &commit_bytes);
@@ -291,6 +305,40 @@ mod tests {
 
         // Ensure dir_b's tree was NOT included
         assert!(!objects.iter().any(|o| o.oid == b_tree_sha));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_auto_generated_commit_message_in_rebuild_git_objects() -> Result<()> {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new()?;
+        let git_engine = GitEngine::new("https://example.com/repo.git", Some(temp.path()))?;
+        let staging = StagingStore::new(temp.path())?;
+        let vfs = VfsManager::new(std::sync::Arc::new(git_engine), "0000000000000000000000000000000000000000");
+
+        let file = vfs.create_file(ROOT_INODE, "hello.rs", TreeEntryMode::RegularFile)?;
+        staging.record_changed_path("hello.rs");
+        staging.write_at(file.id, 0, b"fn main() {}", None)?;
+
+        let git_engine_ref = vfs.git_engine();
+        let (commit_oid, _, objects) = rebuild_git_objects(
+            &vfs,
+            &staging,
+            git_engine_ref,
+            "1111111111111111111111111111111111111111",
+            "Test <test@example.com>",
+            "", // Empty commit message -> should auto-generate!
+        )
+        .await?;
+
+        let commit_obj = objects.iter().find(|o| o.oid == commit_oid).expect("Commit object must exist");
+        let commit_text = String::from_utf8_lossy(&commit_obj.data);
+        assert!(
+            commit_text.contains("Update hello.rs"),
+            "Expected commit message to contain 'Update hello.rs', got:\n{commit_text}"
+        );
 
         Ok(())
     }

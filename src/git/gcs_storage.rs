@@ -597,6 +597,142 @@ impl GcsGitStorage {
     /// 1. Upload packfile (pack-<sha>.pack)
     /// 2. Upload index file (pack-<sha>.idx)
     /// 3. Update Git refs (HEAD and active branch)
+    /// Performs the equivalent of "git update-server-info" for static HTTP hosting (Dumb HTTP).
+    /// Generates and uploads info/refs and objects/info/packs to GCS and writes them to local cache.
+    pub async fn update_server_info(
+        &self,
+        target_branch: &str,
+        new_commit_oid: &str,
+    ) -> Result<()> {
+        info!("Updating server info (info/refs and objects/info/packs) on GCS...");
+
+        // 1. Collect references:
+        // Key: ref_name -> (sha, peeled_sha_opt)
+        let mut refs_map: HashMap<String, (String, Option<String>)> = HashMap::new();
+
+        // A. Read packed-refs if present
+        let packed_refs_path = format!("{}packed-refs", self.prefix);
+        if let Ok(bytes) = self.read_full_object(&packed_refs_path).await {
+            let text = String::from_utf8_lossy(&bytes);
+            let mut last_ref_name: Option<String> = None;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('#') || line.is_empty() {
+                    continue;
+                }
+                if line.starts_with('^') {
+                    let peeled_sha = line.trim_start_matches('^').trim();
+                    if peeled_sha.len() == 40 {
+                        if let Some(ref r_name) = last_ref_name {
+                            if let Some(entry) = refs_map.get_mut(r_name) {
+                                entry.1 = Some(peeled_sha.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 && parts[0].len() == 40 {
+                        let sha = parts[0].to_string();
+                        let ref_name = parts[1].to_string();
+                        refs_map.insert(ref_name.clone(), (sha, None));
+                        last_ref_name = Some(ref_name);
+                    }
+                }
+            }
+        }
+
+        // B. Discover loose refs under refs/ in GCS
+        let refs_prefix = format!("{}refs/", self.prefix);
+        let list_builder = self
+            .control
+            .list_objects()
+            .set_parent(&self.bucket)
+            .set_prefix(&refs_prefix);
+
+        if let Ok(resp) = list_builder.send().await {
+            for obj in resp.objects {
+                let obj_name = obj.name;
+                if let Some(ref_name) = obj_name.strip_prefix(&self.prefix) {
+                    if let Ok(bytes) = self.read_full_object(&obj_name).await {
+                        let sha = String::from_utf8_lossy(&bytes).trim().to_string();
+                        if sha.len() == 40 {
+                            // Loose ref overrides packed-refs
+                            let peeled = refs_map.get(ref_name).and_then(|e| e.1.clone());
+                            refs_map.insert(ref_name.to_string(), (sha, peeled));
+                        }
+                    }
+                }
+            }
+        }
+
+        // C. Explicitly ensure target branch ref is updated to new_commit_oid
+        let target_ref_name = format!("refs/heads/{target_branch}");
+        refs_map.insert(target_ref_name, (new_commit_oid.to_string(), None));
+
+        // Format info/refs content
+        let ref_entries: Vec<(String, String, Option<String>)> = refs_map
+            .into_iter()
+            .map(|(name, (sha, peeled))| (name, sha, peeled))
+            .collect();
+        let info_refs_content = format_info_refs(&ref_entries);
+
+        // Upload info/refs to GCS
+        let info_refs_path = format!("{}info/refs", self.prefix);
+        self.write_rapid_object(&info_refs_path, info_refs_content.as_bytes()).await?;
+
+        // Cache info/refs locally
+        let local_info_refs = self.cache_dir.join("info").join("refs");
+        if let Some(p) = local_info_refs.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        let _ = fs::write(&local_info_refs, info_refs_content.as_bytes());
+
+        // 2. Discover packfiles for objects/info/packs
+        let mut pack_names: Vec<String> = self
+            .pack_names()
+            .into_iter()
+            .map(|p| p.rsplit('/').next().unwrap_or(&p).to_string())
+            .collect();
+
+        let pack_prefix = format!("{}objects/pack/", self.prefix);
+        let list_packs = self
+            .control
+            .list_objects()
+            .set_parent(&self.bucket)
+            .set_prefix(&pack_prefix);
+
+        if let Ok(resp) = list_packs.send().await {
+            for obj in resp.objects {
+                if obj.name.ends_with(".pack") {
+                    let basename = obj.name.rsplit('/').next().unwrap_or(&obj.name).to_string();
+                    pack_names.push(basename);
+                }
+            }
+        }
+
+        let info_packs_content = format_info_packs(&pack_names);
+
+        // Upload objects/info/packs to GCS
+        let info_packs_path = format!("{}objects/info/packs", self.prefix);
+        self.write_rapid_object(&info_packs_path, info_packs_content.as_bytes()).await?;
+
+        // Cache objects/info/packs locally
+        let local_info_packs = self.cache_dir.join("objects").join("info").join("packs");
+        if let Some(p) = local_info_packs.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        let _ = fs::write(&local_info_packs, info_packs_content.as_bytes());
+
+        info!("Successfully updated info/refs and objects/info/packs on GCS");
+        Ok(())
+    }
+
+    /// Writes a completed packfile, index, and commit ref to the GCS Rapid repository.
+    /// Order:
+    /// 1. Upload packfile (pack-<sha>.pack)
+    /// 2. Upload index file (pack-<sha>.idx)
+    /// 3. Update Git refs (HEAD and active branch)
+    /// 4. Update Dumb HTTP server info (info/refs and objects/info/packs)
     pub async fn write_completed_commit(
         &self,
         commit_oid: &str,
@@ -626,21 +762,125 @@ impl GcsGitStorage {
         // Update Git refs on GCS Rapid
         info!("Updating Git refs on GCS Rapid with commit {commit_oid}...");
         let commit_payload = format!("{commit_oid}\n").into_bytes();
-
-        // 1. Update HEAD
-        let head_name = format!("{}HEAD", self.prefix);
-        self.write_rapid_object(&head_name, &commit_payload).await?;
-
-        // 2. Update active branch ref if specified or default master
         let target_branch = branch.unwrap_or("master");
+
+        // 1. Update HEAD as a symbolic ref so git clone automatically checks out the branch
+        let head_name = format!("{}HEAD", self.prefix);
+        let head_payload = format!("ref: refs/heads/{target_branch}\n").into_bytes();
+        self.write_rapid_object(&head_name, &head_payload).await?;
+
+        let local_head = self.cache_dir.join("HEAD");
+        let _ = fs::write(&local_head, &head_payload);
+
+        // 2. Update active branch ref
         let branch_ref = format!("{}refs/heads/{target_branch}", self.prefix);
         self.write_rapid_object(&branch_ref, &commit_payload).await?;
+
+        let local_branch_ref = self.cache_dir.join("refs").join("heads").join(target_branch);
+        if let Some(p) = local_branch_ref.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        let _ = fs::write(&local_branch_ref, &commit_payload);
 
         info!("Successfully updated HEAD and {branch_ref} to commit {commit_oid} on GCS Rapid");
 
         // Refresh pack indexes so the new pack is immediately available in memory
         self.refresh_pack_indexes().await?;
 
+        // 3. Update server info files (info/refs and objects/info/packs) for Dumb HTTP git clone
+        self.update_server_info(target_branch, commit_oid).await?;
+
         Ok(())
     }
 }
+
+/// Formats the content of info/refs from a slice of (ref_name, sha, peeled_sha_opt).
+/// Returns entries sorted alphabetically by ref_name.
+pub fn format_info_refs(entries: &[(String, String, Option<String>)]) -> String {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::new();
+    for (ref_name, sha, peeled) in sorted {
+        out.push_str(&format!("{sha}\t{ref_name}\n"));
+        if let Some(peeled_sha) = peeled {
+            out.push_str(&format!("{peeled_sha}\t{ref_name}^{{}}\n"));
+        }
+    }
+    out
+}
+
+/// Formats the content of objects/info/packs from a slice of pack names.
+/// Extracts basenames, deduplicates, sorts, and adds a trailing newline.
+pub fn format_info_packs(pack_names: &[String]) -> String {
+    let mut sorted: Vec<String> = pack_names
+        .iter()
+        .map(|name| name.rsplit('/').next().unwrap_or(name).to_string())
+        .filter(|name| name.ends_with(".pack"))
+        .collect();
+    sorted.sort();
+    sorted.dedup();
+    let mut out = String::new();
+    for name in sorted {
+        out.push_str(&format!("P {name}\n"));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_info_refs_sorting_and_peeling() {
+        let entries = vec![
+            (
+                "refs/heads/master".to_string(),
+                "1111111111111111111111111111111111111111".to_string(),
+                None,
+            ),
+            (
+                "refs/tags/v1.0".to_string(),
+                "2222222222222222222222222222222222222222".to_string(),
+                Some("3333333333333333333333333333333333333333".to_string()),
+            ),
+            (
+                "refs/heads/feature".to_string(),
+                "4444444444444444444444444444444444444444".to_string(),
+                None,
+            ),
+        ];
+
+        let formatted = format_info_refs(&entries);
+        let expected = "\
+4444444444444444444444444444444444444444\trefs/heads/feature
+1111111111111111111111111111111111111111\trefs/heads/master
+2222222222222222222222222222222222222222\trefs/tags/v1.0
+3333333333333333333333333333333333333333\trefs/tags/v1.0^{}
+";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn test_format_info_packs_dedup_and_sort() {
+        let packs = vec![
+            "objects/pack/pack-bbbb.pack".to_string(),
+            "pack-aaaa.pack".to_string(),
+            "pack-bbbb.pack".to_string(),
+            "some/other/path/pack-cccc.pack".to_string(),
+            "ignored-file.idx".to_string(),
+        ];
+
+        let formatted = format_info_packs(&packs);
+        let expected = "\
+P pack-aaaa.pack
+P pack-bbbb.pack
+P pack-cccc.pack
+
+";
+        assert_eq!(formatted, expected);
+    }
+}
+

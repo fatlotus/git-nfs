@@ -37,6 +37,7 @@ pub async fn replay_wal_entries(
             }
             WalPayload::CreateFile(create) => {
                 debug!("Replay CREATE_FILE: {}", create.path);
+                staging.record_changed_path(&create.path);
                 let (parent_id, name) = vfs.ensure_parent_dirs(&create.path)?;
                 let mode = match create.inode_type() {
                     InodeType::ExecutableFile => TreeEntryMode::ExecutableFile,
@@ -48,6 +49,7 @@ pub async fn replay_wal_entries(
             }
             WalPayload::Mkdir(mkdir) => {
                 debug!("Replay MKDIR: {}", mkdir.path);
+                staging.record_changed_path(&mkdir.path);
                 let (parent_id, name) = vfs.ensure_parent_dirs(&mkdir.path)?;
                 vfs.mkdir(parent_id, &name)?;
             }
@@ -58,6 +60,7 @@ pub async fn replay_wal_entries(
                     write.offset,
                     write.data.len()
                 );
+                staging.record_changed_path(&write.path);
                 let node_id = match vfs.lookup_path(&write.path) {
                     Ok(id) => id,
                     Err(_) => {
@@ -93,6 +96,7 @@ pub async fn replay_wal_entries(
             }
             WalPayload::Truncate(trunc) => {
                 debug!("Replay TRUNCATE: {} to {} bytes", trunc.path, trunc.new_size);
+                staging.record_changed_path(&trunc.path);
                 if let Ok(node_id) = vfs.lookup_path(&trunc.path) {
                     let node = vfs
                         .get_node(node_id)
@@ -115,6 +119,7 @@ pub async fn replay_wal_entries(
             }
             WalPayload::Remove(remove) => {
                 debug!("Replay REMOVE: {}", remove.path);
+                staging.record_changed_path(&remove.path);
                 if let Ok(node_id) = vfs.lookup_path(&remove.path) {
                     if let Ok((parent_id, name)) = vfs.ensure_parent_dirs(&remove.path) {
                         let _ = vfs.remove(parent_id, &name);
@@ -124,6 +129,8 @@ pub async fn replay_wal_entries(
             }
             WalPayload::Rename(rename) => {
                 debug!("Replay RENAME: {} -> {}", rename.from_path, rename.to_path);
+                staging.record_changed_path(&rename.from_path);
+                staging.record_changed_path(&rename.to_path);
                 if let Ok((from_parent, from_name)) = vfs.ensure_parent_dirs(&rename.from_path) {
                     if let Ok((to_parent, to_name)) = vfs.ensure_parent_dirs(&rename.to_path) {
                         let _ = vfs.rename(from_parent, &from_name, to_parent, &to_name);

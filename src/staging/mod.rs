@@ -13,6 +13,8 @@ pub struct StagingStore {
     staged_nodes: RwLock<HashMap<u64, u64>>,
     // Track nodes that have been deleted: node_id
     deleted_nodes: RwLock<HashSet<u64>>,
+    // Track repository-relative paths modified, created, or deleted
+    changed_paths: RwLock<HashSet<String>>,
 }
 
 impl StagingStore {
@@ -27,6 +29,7 @@ impl StagingStore {
             staging_dir,
             staged_nodes: RwLock::new(HashMap::new()),
             deleted_nodes: RwLock::new(HashSet::new()),
+            changed_paths: RwLock::new(HashSet::new()),
         })
     }
 
@@ -175,8 +178,38 @@ impl StagingStore {
         self.staged_nodes.read().keys().copied().collect()
     }
 
+    /// Records a repository-relative path that was modified, created, or deleted.
+    pub fn record_changed_path(&self, path: &str) {
+        let clean = path.trim().trim_matches('/');
+        if !clean.is_empty() {
+            self.changed_paths.write().insert(clean.to_string());
+        }
+    }
+
+    /// Returns a list of all recorded changed paths.
+    pub fn list_changed_paths(&self) -> Vec<String> {
+        self.changed_paths.read().iter().cloned().collect()
+    }
+
     /// Checks if any modifications exist.
     pub fn has_modifications(&self) -> bool {
-        !self.staged_nodes.read().is_empty() || !self.deleted_nodes.read().is_empty()
+        !self.staged_nodes.read().is_empty()
+            || !self.deleted_nodes.read().is_empty()
+            || !self.changed_paths.read().is_empty()
+    }
+
+    /// Clears staged nodes, deleted nodes, and changed paths, and cleans up
+    /// all staged files on disk so subsequent edits begin with a clean staging area.
+    pub fn reset(&self) -> Result<()> {
+        self.staged_nodes.write().clear();
+        self.deleted_nodes.write().clear();
+        self.changed_paths.write().clear();
+
+        if self.staging_dir.exists() {
+            let _ = fs::remove_dir_all(&self.staging_dir);
+        }
+        fs::create_dir_all(&self.staging_dir).context("Re-creating clean staging directory")?;
+
+        Ok(())
     }
 }
